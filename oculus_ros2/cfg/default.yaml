@@ -1,6 +1,6 @@
 /**:
   ros__parameters:
-    frame_id: "sonar" # Frame of reference for the ping messages. Default value is "sonar".
+    frame_id: "fildlab_asv_1/oculus_link" # Frame of reference for the ping messages. Default value is "sonar".
 
     temperature_warn: 30. # Sonar temperature at which a warning is raised. Default value is 30.0.
     temperature_stop: 35. # Sonar temperature at which the sonar goes to standby mode. Default value is 35.0.
@@ -11,7 +11,7 @@
     # 1: Low frequency (1.2MHz, wide aperture).
     # 2: High frequency (2.1MHz, narrow aperture).
 
-    ping_rate: 2 # Frequency of ping fires. Default value is 2.
+    ping_rate: 1 # Frequency of ping fires. Set to 1 (15 Hz) to match ViewPoint. Upstream default is 2.
     # 0: 10Hz max ping rate.
     # 1: 15Hz max ping rate.
     # 2: 40Hz max ping rate.
@@ -23,12 +23,32 @@
     #  0: Oculus outputs 256 beams.
     #  1: Oculus outputs 512 beams.
 
-    gain_assist: True # Enable gain assist. Default value is True.
+    gain_assist: True # Enable gain assist ("gain boost" in ViewPoint). Default value is True.
+    # NOTE: this only actually took effect from 2026-08-24. setMinimalFlags() used to clear the
+    # GAIN_ASSIST flag bit right after sendParamToSonar() set it, so the parameter was inert and
+    # always read back False. IMPORTANT: enable it at BOOT, as here. Toggling gain_assist on a
+    # RUNNING node has twice made the sonar stop answering config requests, drop the TCP
+    # connection, and abort the node ("send: Connection reset by peer"). Set it here and restart
+    # rather than changing it at runtime.
 
-    range: 20.0 # Sonar range (in meters), min=0.3, max=40.0.  Default value is 20.0.
+    range: 6.0 # Sonar range (in meters), min=0.3, max=40.0. Set to 6.0 to match ViewPoint. Upstream default is 20.0.
+    # NOTE: range drives n_ranges, which drives the published image size (6 m -> 1080x595,
+    # 20 m -> 900x496). Image scale is range/n_ranges m per pixel and is NOT published anywhere.
+
+    gain_correction: False # Display-only (not sent to the sonar): divide the sonar's range gain
+    # (TVG) back out before rendering the fan image. False matches ViewPoint and gives an evenly
+    # lit fan. True recovers physically consistent backscatter for analysis, but saturates the
+    # near field to white (~9.5x amplification at the apex) and leaves the far field near-black.
+
+    normalize: True # Display-only: percentile contrast stretch so the fan uses the full 0..255
+    # range. Raw returns sit very low (measured p50=11, p90=19, p99=40 of 255), so without this
+    # the image renders almost black. Set False for un-stretched, absolute pixel values.
+    normalize_percentile: 99.0 # Percentile mapped to 255. Anchored on a percentile rather than
+    # max because a few specular near-field returns reach ~249 and would make a max-based
+    # stretch a no-op. Lower = brighter/more clipping. 99.0 gives about 6.4x at 6 m in a bucket.
 
     # These parameters are for scaling data (investigate)
-    gamma_correction: 153 # Gamma correction, min=0, max=255.  Default value is 153 (60%).
+    gamma_correction: 128 # Gamma correction, min=0, max=255. 128 = 0.50 to match ViewPoint. Upstream default is 153 (60%).
     gain_percent: 50.0 # Gain percentage (%), min=0.1, max=100.0.  Default value is 50.0.
 
     sound_speed: 0.0 # Sound speed (in m/s, set to 0 for it to be calculated using salinity), min=1400.0, max=1600.0. Default value is 0.0.
