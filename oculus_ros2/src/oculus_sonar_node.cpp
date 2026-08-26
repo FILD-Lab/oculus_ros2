@@ -34,6 +34,8 @@
 
 #include <oculus_ros2/oculus_sonar_node.hpp>
 
+#include <cmath>
+
 using SonarDriver = oculus::SonarDriver;
 
 OculusSonarNode::OculusSonarNode()
@@ -97,8 +99,11 @@ OculusSonarNode::OculusSonarNode()
     }
   }
 
-  // Get the current sonar config
-  updateLocalParameters(currentSonarParameters_, this->sonar_driver_->current_ping_config());
+  // Get the current sonar config. Seed currentConfig_ too -- sendParamToSonar() builds every
+  // request from it, so without this the first fire message of the session is built on
+  // uninitialised memory.
+  currentConfig_ = this->sonar_driver_->current_ping_config();
+  updateLocalParameters(currentSonarParameters_, currentConfig_);
   for (const std::string& param_name : dynamic_parameters_names_) {
     setConfigCallback(this->get_parameters(std::vector{param_name}));
   }
@@ -139,11 +144,12 @@ void OculusSonarNode::setMinimalFlags(uint8_t& flags) const {
          | flagByte::SEND_GAINS  // force send gain to true this
          | flagByte::SIMPLE_PING;  // use simple ping
 
-  if (currentSonarParameters_.frequency_mode == params::FREQUENCY_MODE.max) {
-    // TODO(hugoyvrn, gain_assist not working, to fix)
-    // flags |= flagByte::GAIN_ASSIST;
-    flags &= ~flagByte::GAIN_ASSIST;
-  }
+  // GAIN_ASSIST (bit 4) is deliberately NOT touched here. It used to be force-cleared whenever
+  // frequency_mode sat at its max -- which is the default mode -- so sendParamToSonar would set
+  // the bit from the gain_assist parameter and this function wiped it a few lines later, before
+  // the config ever reached the sonar. That made the parameter inert and is why it always read
+  // back False. The parameter now controls the bit; the known hazard (changing frequency while
+  // gain assist is enabled) is still guarded in setConfigCallback.
 
   // flags | 0x02 make wird change (depending of the configuration)
   // flags |= 0x02;
@@ -170,9 +176,9 @@ void OculusSonarNode::checkMinimalFlags(const uint8_t& flags) const {
 }
 
 void OculusSonarNode::publishStatus(const OculusStatusMsg& status) {
-  if (status.partNumber != OculusPartNumberType::partNumberM1200d) {
+  if (status.partNumber != OculusPartNumberType::partNumberM750d) {
     RCLCPP_ERROR_STREAM(get_logger(),
-        "The sonar version seems to be different than M1200d."
+        "The sonar version seems to be different than M750d."
         " This driver is not suppose to work with your sonar.");
   }
 
@@ -219,17 +225,10 @@ void OculusSonarNode::updateRosConfig() {
   updateRosConfigForParam<double>(currentRosParameters_.salinity, currentSonarParameters_.salinity, params::SALINITY.name);
 }
 
-int OculusSonarNode::get_subscription_count() const {
-  return this->ping_publisher_->get_subscription_count() + sonar_viewer_.image_publisher_->get_subscription_count();
-}
-
 void OculusSonarNode::publishPing(const oculus::PingMessage::ConstPtr& ping) {
   // Check if the sonar must go in standby mode
   checkOverheating(ping->temperature());
   if (!is_running_) {
-    disableRunMode();
-  } else if (get_subscription_count() == 0) {
-    RCLCPP_INFO(this->get_logger(), "There is no subscriber nor to ping topic neither to image topic.");
     disableRunMode();
   } else if (currentSonarParameters_.ping_rate == pingRateStandby) {
     RCLCPP_INFO_STREAM(this->get_logger(), "ping_rate mode is seted to " << pingRateStandby << ".");
@@ -277,7 +276,7 @@ void OculusSonarNode::publishPing(const oculus::PingMessage::ConstPtr& ping) {
 }
 
 void OculusSonarNode::handleDummy() {
-  if (is_running_ && get_subscription_count() > 0 && !is_overheating_ && currentSonarParameters_.ping_rate != pingRateStandby) {
+  if (is_running_ && !is_overheating_ && currentSonarParameters_.ping_rate != pingRateStandby) {
     RCLCPP_INFO(this->get_logger(), "Exiting standby mode");
     enableRunMode();
   }
@@ -361,6 +360,23 @@ void OculusSonarNode::updateLocalParameters(SonarParameters& parameters, SonarDr
   updateLocalParameters(parameters, new_parameters);
 }
 
+bool OculusSonarNode::configLooksSane(const oculus::SonarDriver::PingConfig& config) const {
+  // masterMode/pingRate/gammaCorrection/flags are uint8_t and cannot be out of their own range,
+  // so only the doubles and the enumerated fields are worth checking. This exists to catch a
+  // corrupt or partial read of the feedback struct before it is adopted as the current config --
+  // a bad speedOfSound silently rescales range_resolution and therefore the whole image.
+  const auto finite_in = [](double v, double lo, double hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+
+  if (config.masterMode < params::FREQUENCY_MODE.min || config.masterMode > params::FREQUENCY_MODE.max) return false;
+  if (config.pingRate > pingRateStandby) return false;
+  if (!finite_in(config.range, 0.0, 100.0)) return false;
+  if (!finite_in(config.gainPercent, 0.0, 100.0)) return false;
+  if (!finite_in(config.salinity, 0.0, 100.0)) return false;
+  // speedOfSound is 0 when the sonar is told to derive it from salinity.
+  if (!(config.speedOfSound == 0.0 || finite_in(config.speedOfSound, 1300.0, 1700.0))) return false;
+  return true;
+}
+
 void OculusSonarNode::sendParamToSonar(rclcpp::Parameter param, rcl_interfaces::msg::SetParametersResult result) {
   SonarDriver::PingConfig newConfig = currentConfig_;  // To avoid to create a new SonarDriver::PingConfig from ros parameters
   if (param.get_name() == params::FREQUENCY_MODE.name) {
@@ -412,8 +428,34 @@ void OculusSonarNode::sendParamToSonar(rclcpp::Parameter param, rcl_interfaces::
 
   setMinimalFlags(newConfig.flags);
 
-  // send config to Oculus sonar and wait for feedback
-  SonarDriver::PingConfig feedback = this->sonar_driver_->request_ping_config(newConfig);
+  // send config to Oculus sonar and wait for feedback.
+  //
+  // This call throws on any comms trouble -- boost::system::system_error ("send: Connection reset
+  // by peer") if the sonar drops the TCP session, oculus::CallbackQueue::TimeoutReached if it
+  // stops answering (e.g. ViewPoint holds the single client slot). Nothing used to catch either,
+  // so the exception escaped the callback thread and std::terminate aborted the whole node with
+  // SIGABRT. With Restart=no on the service and no respawn in the launch file, that took the
+  // sonar out until someone noticed. Log and keep the previous config instead.
+  SonarDriver::PingConfig feedback;
+  try {
+    feedback = this->sonar_driver_->request_ping_config(newConfig);
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR_STREAM(this->get_logger(), "Sonar config request failed for parameter '"
+                                                << param.get_name() << "': " << e.what()
+                                                << ". Keeping the previous configuration.");
+    return;
+  }
+
+  if (!configLooksSane(feedback)) {
+    RCLCPP_ERROR_STREAM(this->get_logger(),
+        "Sonar returned an implausible configuration after setting '"
+            << param.get_name() << "' (masterMode=" << static_cast<int>(feedback.masterMode)
+            << " range=" << feedback.range << " gainPercent=" << feedback.gainPercent
+            << " speedOfSound=" << feedback.speedOfSound << " salinity=" << feedback.salinity
+            << "). Ignoring it and keeping the previous configuration.");
+    return;
+  }
+
   currentConfig_ = feedback;
 
   updateLocalParameters(currentSonarParameters_, feedback);
@@ -456,12 +498,9 @@ rcl_interfaces::msg::SetParametersResult OculusSonarNode::setConfigCallback(cons
   for (const rclcpp::Parameter& param : parameters) {
     if (param.get_name() == "run") {
       if (!is_running_ || param.as_bool()) {
-        if (get_subscription_count() == 0 || is_overheating_ || currentSonarParameters_.ping_rate == pingRateStandby) {
+        if (is_overheating_ || currentSonarParameters_.ping_rate == pingRateStandby) {
           result.successful = false;
           result.reason = "The condition to go in run mode are not meeted.";
-          if (get_subscription_count() == 0) {
-            result.reason += " There is no subscriber nor to ping topic neither to image topic.";
-          }
           if (is_overheating_) {
             result.reason +=
                 " Temperature of sonar is to high."

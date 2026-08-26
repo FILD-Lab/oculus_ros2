@@ -53,17 +53,22 @@
 #include <sensor_msgs/msg/fluid_pressure.hpp>
 #include <sensor_msgs/msg/temperature.hpp>
 
+// NOTE: every member is initialised. Without these, currentSonarParameters_ and
+// currentRosParameters_ start out as indeterminate memory and updateRosConfigForParam() happily
+// logs and propagates the garbage -- observed in the field as "The parameter frequency_mode has
+// change by it self from 808464701 to 32" (0x30303030 = ASCII "0000"), use_salinity = 37 for a
+// bool, and salinity = 3.58e+246. Those are reads of uninitialised members, not sonar values.
 struct SonarParameters {
-  int frequency_mode;
-  int ping_rate;
-  int nbeams;
-  bool gain_assist;
-  double range;
-  int gamma_correction;
-  double gain_percent;
-  double sound_speed;
-  bool use_salinity;
-  double salinity;
+  int frequency_mode = 0;
+  int ping_rate = 0;
+  int nbeams = 0;
+  bool gain_assist = false;
+  double range = 0.0;
+  int gamma_correction = 0;
+  double gain_percent = 0.0;
+  double sound_speed = 0.0;
+  bool use_salinity = false;
+  double salinity = 0.0;
 };
 
 namespace flagByte {
@@ -154,19 +159,22 @@ protected:
 
   SonarParameters currentSonarParameters_;
   SonarParameters currentRosParameters_;
-  oculus::SonarDriver::PingConfig currentConfig_;
+  // MUST be value-initialised. PingConfig is OculusSimpleFireMessage, a POD C struct, and
+  // sendParamToSonar() starts every request with `newConfig = currentConfig_`. Left
+  // indeterminate, the first fire message of each boot was uninitialised memory with a single
+  // field overwritten -- including a garbage `flags` byte, whose NBEAMS bit (0x40) randomly
+  // selected 256 vs 512 beams and whose bit 7 is documented to break the sonar connection.
+  // It is also seeded from the sonar in the constructor; this initialiser is the backstop.
+  oculus::SonarDriver::PingConfig currentConfig_ = {};
 
   bool is_running_;  // State value. Same value as ros parameter "run"
   bool is_overheating_ = false;  // State value
 
   mutable std::shared_mutex param_mutex_;  // multithreading protection
 
-  int get_subscription_count() const;
-
 private:
   std::shared_ptr<oculus::SonarDriver> sonar_driver_;
   oculus::AsyncService io_service_;
-  // rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_publisher_;
   SonarViewer sonar_viewer_;
   const std::string frame_id_;
   const double temperature_warn_limit_;
@@ -190,6 +198,8 @@ private:
   void updateLocalParameters(SonarParameters& parameters, const std::vector<rclcpp::Parameter>& new_parameters);
   void updateLocalParameters(SonarParameters& parameters, oculus::SonarDriver::PingConfig feedback);
   void sendParamToSonar(rclcpp::Parameter param, rcl_interfaces::msg::SetParametersResult result);
+  // Reject a feedback struct that cannot have come from the sonar (corrupt/partial read).
+  bool configLooksSane(const oculus::SonarDriver::PingConfig& config) const;
   rcl_interfaces::msg::SetParametersResult setConfigCallback(const std::vector<rclcpp::Parameter>& parameters);
 
   void enableRunMode();

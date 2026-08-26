@@ -33,7 +33,6 @@
 #ifndef OCULUS_ROS2__SONAR_VIEWER_HPP_
 #define OCULUS_ROS2__SONAR_VIEWER_HPP_
 
-#include <cv_bridge/cv_bridge.h>
 #include <oculus_driver/AsyncService.h>
 #include <oculus_driver/SonarDriver.h>
 
@@ -48,9 +47,9 @@
 #include <oculus_interfaces/msg/ping.hpp>
 #include <oculus_ros2/conversions.hpp>
 #include <opencv2/core.hpp>
-#include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/header.hpp>
 
@@ -60,18 +59,29 @@ public:
   ~SonarViewer();
   void publishFan(const oculus::PingMessage::ConstPtr& ping, const std::string& frame_id = "sonar") const;
   void publishFan(const oculus_interfaces::msg::Ping& ros_ping_msg) const;
+  // `bearings` is the sonar's own per-beam bearing table (100ths of a degree, `width` entries,
+  // ascending). It replaces the old hardcoded-aperture + linear-interpolation geometry.
   void publishFan(const int& width,
       const int& height,
       const int& offset,
       const std::vector<uint8_t>& ping_data,
-      const int& master_mode,
+      const int16_t* bearings,
       const std_msgs::msg::Header& header) const;
 
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_publisher_;
 
 protected:
-  const double LOW_FREQUENCY_BEARING_APERTURE_ = 65.;
-  const double HIGHT_FREQUENCY_BEARING_APERTURE_ = 40.;
+  // Display-only: divide the sonar's range gain (TVG) back out before rendering. Default false.
+  static constexpr const char* GAIN_CORRECTION_PARAM_ = "gain_correction";
+
+  // Display-only: percentile contrast stretch, so the fan uses the full 0..255 range.
+  static constexpr const char* NORMALIZE_PARAM_ = "normalize";
+  static constexpr const char* NORMALIZE_PERCENTILE_PARAM_ = "normalize_percentile";
+
+  // NOTE: LOW_/HIGHT_FREQUENCY_BEARING_APERTURE_ (65 deg / 40 deg) used to live here and were
+  // selected by master_mode. They were M1200d values and wrong for this M750d -- measured, the
+  // sonar's real swath in master_mode 2 is +/-65 deg while the code drew +/-40 deg. The bearing
+  // table on every Ping is authoritative for any model and any mode, so the constants are gone.
   const int SIZE_OF_GAIN_ = 4;
 
 private:

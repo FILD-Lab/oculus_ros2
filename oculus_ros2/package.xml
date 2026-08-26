@@ -15,10 +15,12 @@
   <depend> rcl_interfaces </depend>
   <depend> std_msgs </depend>
   <depend> sensor_msgs </depend>
-  <depend> oculus_driver </depend>
+  <!-- OpenCV only: cv_bridge is intentionally NOT a dependency (4.5.4 vs 4.8.0 ABI clash
+       on the Jetson). See CMakeLists.txt and sonar_viewer.cpp. -->
+  <depend> OpenCV </depend>
+  <!-- oculus_driver is an external CMake-only library (not a colcon package);
+       located via find_package + CMAKE_PREFIX_PATH, not colcon's dependency graph. -->
   <depend> oculus_interfaces </depend>
-  <depend> cv_bridge </depend>
-  <depend> OpenCV  </depend>
   <!-- <depend>message_generation</depend> -->
   <!-- <depend>message_runtime</depend> -->
   <!-- <depend>Boost</depend> -->
